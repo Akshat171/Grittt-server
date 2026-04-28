@@ -115,17 +115,20 @@ router.post('/:name/completions', requireAuth, async (req: Request, res: Respons
   const userId = (req as any).userId as string;
   const taskId = req.body?.taskId ?? null;
   const taskName = req.body?.taskName ?? rawName;
+  const completionType = req.body?.completionType ?? 'full';
 
   try {
     const client = await pool.connect();
     try {
+      // Delete existing completion for today first (in case switching between full/tiny)
       await client.query(
-        `INSERT INTO habit_completions (user_id, task_id, task_name, normalized_name, date)
-         SELECT $1, $2, $3, $4, CURRENT_DATE
-         WHERE NOT EXISTS (
-           SELECT 1 FROM habit_completions WHERE user_id = $1 AND normalized_name = $4 AND date = CURRENT_DATE
-         )`,
-        [userId, taskId, taskName, name]
+        `DELETE FROM habit_completions WHERE user_id = $1 AND normalized_name = $2 AND date = CURRENT_DATE`,
+        [userId, name]
+      );
+      await client.query(
+        `INSERT INTO habit_completions (user_id, task_id, task_name, normalized_name, date, completion_type)
+         VALUES ($1, $2, $3, $4, CURRENT_DATE, $5)`,
+        [userId, taskId, taskName, name, completionType]
       );
       res.status(201).json({ ok: true });
     } finally {
@@ -259,6 +262,314 @@ router.get('/score/day', requireAuth, async (req: Request, res: Response) => {
   } catch (err) {
     console.error('Failed to compute day score:', err);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── Streak Shields ─────────────────────────────────────────────────────────────
+const MAX_SHIELDS_PER_MONTH = 2;
+
+function currentMonthKey() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+}
+
+// GET /api/habits/shields - get shields used this month & remaining
+router.get('/shields', requireAuth, async (req: Request, res: Response) => {
+  const userId = (req as any).userId as string;
+  const monthKey = currentMonthKey();
+  try {
+    const r = await pool.query(
+      `SELECT used_date FROM streak_shields WHERE user_id = $1 AND month_key = $2 ORDER BY used_date`,
+      [userId, monthKey]
+    );
+    const used = r.rows.map((row: any) => row.used_date);
+    res.json({ monthKey, used, remaining: MAX_SHIELDS_PER_MONTH - used.length, max: MAX_SHIELDS_PER_MONTH });
+  } catch (err) {
+    console.error('GET /api/habits/shields failed', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// POST /api/habits/shields/use - use a shield for a specific date
+router.post('/shields/use', requireAuth, async (req: Request, res: Response) => {
+  const userId = (req as any).userId as string;
+  const { date } = req.body; // YYYY-MM-DD
+  if (!date) return res.status(400).json({ error: 'Missing date' });
+  const monthKey = currentMonthKey();
+  try {
+    // Check if already used for this date
+    const existing = await pool.query(
+      `SELECT 1 FROM streak_shields WHERE user_id = $1 AND used_date = $2`,
+      [userId, date]
+    );
+    if (existing.rows.length > 0) return res.json({ ok: true, alreadyUsed: true });
+
+    // Check remaining
+    const countRes = await pool.query(
+      `SELECT COUNT(*) as cnt FROM streak_shields WHERE user_id = $1 AND month_key = $2`,
+      [userId, monthKey]
+    );
+    const usedCount = Number(countRes.rows[0].cnt);
+    if (usedCount >= MAX_SHIELDS_PER_MONTH) {
+      return res.status(400).json({ error: 'No shields remaining this month' });
+    }
+
+    await pool.query(
+      `INSERT INTO streak_shields (user_id, used_date, month_key) VALUES ($1, $2, $3)`,
+      [userId, date, monthKey]
+    );
+    res.status(201).json({ ok: true, remaining: MAX_SHIELDS_PER_MONTH - usedCount - 1 });
+  } catch (err) {
+    console.error('POST /api/habits/shields/use failed', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── Bad Day Sync ───────────────────────────────────────────────────────────────
+
+// POST /api/habits/bad-day - log a bad day
+router.post('/bad-day', requireAuth, async (req: Request, res: Response) => {
+  const userId = (req as any).userId as string;
+  const { date } = req.body;
+  if (!date) return res.status(400).json({ error: 'Missing date' });
+  try {
+    await pool.query(
+      `INSERT INTO bad_day_logs (user_id, date) VALUES ($1, $2) ON CONFLICT (date) DO NOTHING`,
+      [userId, date]
+    );
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    console.error('POST /api/habits/bad-day failed', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// DELETE /api/habits/bad-day - remove bad day
+router.delete('/bad-day', requireAuth, async (req: Request, res: Response) => {
+  const userId = (req as any).userId as string;
+  const date = req.query.date as string;
+  if (!date) return res.status(400).json({ error: 'Missing date' });
+  try {
+    await pool.query(`DELETE FROM bad_day_logs WHERE user_id = $1 AND date = $2`, [userId, date]);
+    res.status(204).send();
+  } catch (err) {
+    console.error('DELETE /api/habits/bad-day failed', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ── AI Habit Coach ─────────────────────────────────────────────────────────────
+
+// POST /api/habits/ai/weekly-debrief
+// Generates a personalized weekly habit summary using Claude
+router.post('/ai/weekly-debrief', requireAuth, async (req: Request, res: Response) => {
+  const userId = (req as any).userId as string;
+  try {
+    const client = await pool.connect();
+    try {
+      // Fetch user's tasks
+      const tasksRes = await client.query(
+        `SELECT name, score, days, category, tiny_version, why_started FROM tasks WHERE user_id = $1 AND archived_at IS NULL`,
+        [userId]
+      );
+      const tasks = tasksRes.rows;
+
+      // Fetch last 14 days of completions
+      const compRes = await client.query(
+        `SELECT task_name, normalized_name, date, completion_type
+         FROM habit_completions WHERE user_id = $1 AND date >= CURRENT_DATE - INTERVAL '14 days'
+         ORDER BY date`,
+        [userId]
+      );
+      const completions = compRes.rows;
+
+      // Fetch bad days
+      const badRes = await client.query(
+        `SELECT date FROM bad_day_logs WHERE user_id = $1 AND date >= CURRENT_DATE - INTERVAL '14 days'`,
+        [userId]
+      );
+      const badDays = badRes.rows.map((r: any) => r.date);
+
+      // Fetch shield usage
+      const shieldRes = await client.query(
+        `SELECT used_date FROM streak_shields WHERE user_id = $1 AND month_key = $2`,
+        [userId, currentMonthKey()]
+      );
+      const shields = shieldRes.rows;
+
+      // Build data summary for AI
+      const tasksSummary = tasks.map((t: any) =>
+        `- ${t.name} (${t.category}, ${t.score}pts, scheduled: ${JSON.parse(JSON.stringify(t.days)).join(',')}${t.tiny_version ? `, tiny: "${t.tiny_version}"` : ''}${t.why_started ? `, why: "${t.why_started}"` : ''})`
+      ).join('\n');
+
+      const compSummary = completions.map((c: any) =>
+        `${c.date}: ${c.task_name} (${c.completion_type})`
+      ).join('\n');
+
+      const OpenAI = (await import('openai')).default;
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+      const prompt = `You are a supportive, insightful habit coach. Analyze this user's habit data and generate a personalized weekly debrief.
+
+HABITS:
+${tasksSummary}
+
+COMPLETIONS (last 14 days):
+${compSummary || 'No completions recorded.'}
+
+BAD DAYS: ${badDays.length > 0 ? badDays.join(', ') : 'None'}
+SHIELDS USED THIS MONTH: ${shields.length}/${MAX_SHIELDS_PER_MONTH}
+
+Rules:
+1. Be honest but NEVER harsh. Frame everything constructively.
+2. Identify ONE specific pattern the user might not notice themselves.
+3. If they used "Bad Day" mode, praise them for showing up small instead of quitting.
+4. Reference their "why" motivation if they have one — remind them of their own words.
+5. Give ONE specific, actionable suggestion for next week.
+6. Use identity-based language: "You ARE someone who..." not "You should try to..."
+7. Keep it under 150 words total.
+
+Return ONLY JSON: {"summary": "...", "pattern": "...", "suggestion": "...", "identity": "..."}`;
+
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        max_tokens: 400,
+        messages: [{ role: 'user', content: prompt }],
+      });
+
+      const raw = completion.choices[0]?.message?.content ?? '{}';
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+
+      res.json({
+        summary: parsed.summary ?? '',
+        pattern: parsed.pattern ?? '',
+        suggestion: parsed.suggestion ?? '',
+        identity: parsed.identity ?? '',
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('AI weekly debrief error:', err?.message);
+    res.status(500).json({ error: 'AI request failed' });
+  }
+});
+
+// POST /api/habits/ai/recovery-nudge
+// When a user misses a habit, get a personalized recovery message
+router.post('/ai/recovery-nudge', requireAuth, async (req: Request, res: Response) => {
+  const userId = (req as any).userId as string;
+  const { habitName, streak, momentum, tinyVersion, whyStarted } = req.body;
+  if (!habitName) return res.status(400).json({ error: 'Missing habitName' });
+
+  try {
+    const OpenAI = (await import('openai')).default;
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+    const prompt = `You are a supportive habit coach. The user missed their habit "${habitName}" yesterday.
+
+Context:
+- Current streak before miss: ${streak ?? 0} days
+- Momentum score: ${momentum ?? 0}%
+${tinyVersion ? `- They have a tiny version: "${tinyVersion}"` : ''}
+${whyStarted ? `- Their motivation: "${whyStarted}"` : ''}
+
+Generate a short, warm recovery nudge (2-3 sentences max). Rules:
+1. NEVER say "you failed" or make them feel guilty
+2. If they have a tiny version, suggest doing that today
+3. Reference their momentum score — one day barely dents it
+4. If they have a "why", subtly reference it
+5. Use identity-based framing: "You're still someone who..."
+
+Return ONLY JSON: {"nudge": "...", "suggestTiny": true/false}`;
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const raw = completion.choices[0]?.message?.content ?? '{}';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+
+    res.json({ nudge: parsed.nudge ?? '', suggestTiny: parsed.suggestTiny ?? false });
+  } catch (err: any) {
+    console.error('AI recovery nudge error:', err?.message);
+    res.status(500).json({ error: 'AI request failed' });
+  }
+});
+
+// POST /api/habits/ai/patterns
+// Analyze 30 days of data for non-obvious correlations
+router.post('/ai/patterns', requireAuth, async (req: Request, res: Response) => {
+  const userId = (req as any).userId as string;
+  try {
+    const client = await pool.connect();
+    try {
+      const tasksRes = await client.query(
+        `SELECT name, score, days, category FROM tasks WHERE user_id = $1 AND archived_at IS NULL`,
+        [userId]
+      );
+
+      const compRes = await client.query(
+        `SELECT task_name, date, completion_type
+         FROM habit_completions WHERE user_id = $1 AND date >= CURRENT_DATE - INTERVAL '30 days'
+         ORDER BY date`,
+        [userId]
+      );
+
+      const badRes = await client.query(
+        `SELECT date FROM bad_day_logs WHERE user_id = $1 AND date >= CURRENT_DATE - INTERVAL '30 days'`,
+        [userId]
+      );
+
+      if (compRes.rows.length < 7) {
+        return res.json({ patterns: [], message: 'Need at least 7 days of data for pattern detection.' });
+      }
+
+      const OpenAI = (await import('openai')).default;
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+      const tasksList = tasksRes.rows.map((t: any) => `${t.name} (${t.category})`).join(', ');
+      const compList = compRes.rows.map((c: any) => `${c.date}: ${c.task_name} (${c.completion_type})`).join('\n');
+      const badDays = badRes.rows.map((r: any) => r.date).join(', ');
+
+      const prompt = `You are a behavioral data analyst. Analyze this user's 30-day habit data and find patterns they might not see.
+
+HABITS: ${tasksList}
+
+COMPLETIONS:
+${compList}
+
+BAD DAYS: ${badDays || 'None'}
+
+Find 2-3 specific, non-obvious patterns. Examples:
+- "You complete gym habits 90% on Monday/Wednesday but only 40% on Friday"
+- "Your best streaks happen when you complete morning habits before 10am"
+- "You tend to miss habits the day after a bad day — consider using tiny versions on recovery days"
+
+Return ONLY JSON: {"patterns": [{"insight": "...", "actionable": "..."}]}
+Each pattern needs: insight (what you found) and actionable (what to do about it).`;
+
+      const completion = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        max_tokens: 400,
+        messages: [{ role: 'user', content: prompt }],
+      });
+
+      const raw = completion.choices[0]?.message?.content ?? '{}';
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
+
+      res.json({ patterns: Array.isArray(parsed.patterns) ? parsed.patterns : [] });
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('AI patterns error:', err?.message);
+    res.status(500).json({ error: 'AI request failed' });
   }
 });
 
