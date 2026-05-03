@@ -252,7 +252,7 @@ router.get('/google/mobile/callback', (req: Request, res: Response, next) => {
 
 // App polls this endpoint while the browser is open
 router.get('/google/mobile/poll/:session', (req: Request, res: Response) => {
-  const { session } = req.params;
+  const session = req.params.session as string;
   const pending = mobilePending.get(session);
 
   if (!pending || Date.now() > pending.expiresAt) {
