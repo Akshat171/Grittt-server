@@ -1,10 +1,10 @@
 import { Router, Request, Response } from 'express';
-import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { requireAuth } from '../middleware/auth';
 
 const router = Router();
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 // ── POST /api/ai/food-coach ────────────────────────────────────────────────────
 // Body: { dailyLogs: [{date, calories, protein, carbs, fats}], calorieGoal, proteinGoal }
@@ -35,13 +35,13 @@ Each tip must be 1-2 sentences max. Be specific, use their actual numbers.
 No intros, no fluff. Return ONLY a JSON object: {"tips": ["tip1", "tip2", "tip3"]}`;
 
   try {
-    const message = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
       max_tokens: 300,
       messages: [{ role: 'user', content: prompt }],
     });
 
-    const raw = (message.content[0] as any).text ?? '{}';
+    const raw = completion.choices[0]?.message?.content ?? '{}';
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
     const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
     const tips: string[] = Array.isArray(parsed.tips) ? parsed.tips : [];
@@ -85,13 +85,13 @@ Return ONLY this JSON (no extra text):
 }`;
 
   try {
-    const message = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
       max_tokens: 800,
       messages: [{ role: 'user', content: prompt }],
     });
 
-    const raw = (message.content[0] as any).text ?? '{}';
+    const raw = completion.choices[0]?.message?.content ?? '{}';
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
     const parsed = jsonMatch ? JSON.parse(jsonMatch[0]) : {};
 
