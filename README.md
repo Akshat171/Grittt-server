@@ -603,3 +603,4 @@ WHERE user_id = (SELECT id FROM users WHERE email = 'user@example.com')
 SELECT u.email, s.total_xp, s.level_name
 FROM strength_identity s JOIN users u ON s.user_id = u.id;
 ```
+# Grittt-server
