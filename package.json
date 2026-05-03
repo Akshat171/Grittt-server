@@ -11,6 +11,9 @@
     "db:migrate-strength": "ts-node-dev --transpile-only src/db/migrate-strength.ts",
     "db:migrate-startdate": "ts-node-dev --transpile-only src/db/migrate-startdate.ts"
   },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
