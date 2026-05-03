@@ -44,7 +44,7 @@ router.post('/signup', async (req: Request, res: Response) => {
   setTokenCookie(res, token);
 
   res.status(201).json({
-    user: { id: user.id, email: user.email, name: user.name, avatar_url: user.avatar_url },
+    user: { id: user.id, email: user.email, name: user.name, avatar_url: user.avatar_url, created_at: user.created_at },
     token,
   });
 });
@@ -76,7 +76,7 @@ router.post('/login', async (req: Request, res: Response) => {
   setTokenCookie(res, token);
 
   res.json({
-    user: { id: user.id, email: user.email, name: user.name, avatar_url: user.avatar_url },
+    user: { id: user.id, email: user.email, name: user.name, avatar_url: user.avatar_url, created_at: user.created_at },
     token,
   });
 });
@@ -141,7 +141,7 @@ router.post('/google/verify-token', async (req: Request, res: Response) => {
     setTokenCookie(res, token);
 
     res.json({
-      user: { id: user.id, email: user.email, name: user.name, avatar_url: user.avatar_url },
+      user: { id: user.id, email: user.email, name: user.name, avatar_url: user.avatar_url, created_at: user.created_at },
       token,
     });
   } catch (err) {
