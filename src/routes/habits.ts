@@ -340,7 +340,7 @@ router.post('/bad-day', requireAuth, async (req: Request, res: Response) => {
   if (!date) return res.status(400).json({ error: 'Missing date' });
   try {
     await pool.query(
-      `INSERT INTO bad_day_logs (user_id, date) VALUES ($1, $2) ON CONFLICT (date) DO NOTHING`,
+      `INSERT INTO bad_day_logs (user_id, date) VALUES ($1, $2) ON CONFLICT (user_id, date) DO NOTHING`,
       [userId, date]
     );
     res.status(201).json({ ok: true });
