@@ -9,6 +9,12 @@ function normalizeName(name: string) {
   return name.trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function toUuidOrNull(val: any): string | null {
+  if (typeof val === 'string' && UUID_REGEX.test(val)) return val;
+  return null;
+}
+
 // Compute streak length from an array of completion dates (Date objects) ordered desc
 function computeStreakFromDates(dates: Date[]) {
   if (!dates || dates.length === 0) return 0;
@@ -113,7 +119,7 @@ router.post('/:name/completions', requireAuth, async (req: Request, res: Respons
   if (!rawName) return res.status(400).json({ error: 'Missing habit name' });
   const name = normalizeName(rawName);
   const userId = (req as any).userId as string;
-  const taskId = req.body?.taskId ?? null;
+  const taskId = toUuidOrNull(req.body?.taskId);
   const taskName = req.body?.taskName ?? rawName;
   const completionType = req.body?.completionType ?? 'full';
 
