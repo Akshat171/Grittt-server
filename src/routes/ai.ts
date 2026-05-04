@@ -102,4 +102,68 @@ Return ONLY this JSON (no extra text):
   }
 });
 
+// ── POST /api/ai/snap-track ───────────────────────────────────────────────────
+// Body: { imageBase64: string }   (data URI or raw base64, jpeg/png)
+// Returns: { name, calories, protein, carbs, fats, servingNote }
+
+router.post('/snap-track', requireAuth, async (req: Request, res: Response) => {
+  const { imageBase64 } = req.body;
+
+  if (!imageBase64 || typeof imageBase64 !== 'string') {
+    res.status(400).json({ error: 'imageBase64 is required' });
+    return;
+  }
+
+  // Accept either a raw base64 string or a data URI (data:image/jpeg;base64,...)
+  const base64Data = imageBase64.includes(',') ? imageBase64.split(',')[1] : imageBase64;
+  const mimeType   = imageBase64.startsWith('data:image/png') ? 'image/png' : 'image/jpeg';
+
+  const prompt = `You are a precise nutrition analyst. Look at this food image and estimate its nutritional content.
+Return ONLY a JSON object with these exact fields (numbers only, no units in values):
+{
+  "name": "descriptive food name",
+  "calories": number,
+  "protein": number (grams),
+  "carbs": number (grams),
+  "fats": number (grams),
+  "servingNote": "brief note about estimated portion size"
+}
+If you cannot identify food in the image, return { "error": "No food detected" }.`;
+
+  try {
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      max_tokens: 200,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Data}`, detail: 'low' } },
+          ],
+        },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content ?? '{}';
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) { res.status(500).json({ error: 'AI returned unexpected format' }); return; }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (parsed.error) { res.status(422).json({ error: parsed.error }); return; }
+
+    res.json({
+      name:        String(parsed.name        ?? 'Unknown food'),
+      calories:    Number(parsed.calories    ?? 0),
+      protein:     Number(parsed.protein     ?? 0),
+      carbs:       Number(parsed.carbs       ?? 0),
+      fats:        Number(parsed.fats        ?? 0),
+      servingNote: String(parsed.servingNote ?? ''),
+    });
+  } catch (err: any) {
+    console.error('snap-track error:', err?.message);
+    res.status(500).json({ error: 'AI request failed' });
+  }
+});
+
 export default router;
